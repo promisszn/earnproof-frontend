@@ -1,15 +1,17 @@
 # Contract successor migration readiness
 
-Implements [#266](https://github.com/veridatum-labs/earnproof-frontend/issues/266):
-clear route-level guidance when a contract is preparing to move, has been
-decommissioned, or has been replaced by a successor.
+Implements [#266](https://github.com/veridatum-labs/earnproof-frontend/issues/266)
+(route-level guidance when a contract is preparing to move, has been
+decommissioned, or has been replaced by a successor) and
+[#308](https://github.com/veridatum-labs/earnproof-frontend/issues/308)
+(connecting that guidance to the live backend instead of the local fixture).
 
 ## Where it lives
 
 | Concern | Module |
 | --- | --- |
-| Status shape, validation, gating, link resolution | `lib/api/contract-migration.ts` |
-| Banner, self-loading mount, action gate | `components/common/contract-migration-banner.tsx` |
+| Status shape, validation, gating, link resolution, real backend client | `lib/api/contract-migration.ts` |
+| Banner, self-loading + polling mount, action gate | `components/common/contract-migration-banner.tsx` |
 | Global mount point | `app/layout.tsx` |
 
 ## Status document
@@ -32,10 +34,49 @@ type ContractMigrationStatus = {
 };
 ```
 
-There is no `/contracts/migration` endpoint in the API spec yet, so
-`fetchMockContractMigrationStatus()` is a fixture/forward contract, shaped
-exactly like a real response. When a real endpoint ships, only the fetcher
-changes — never the gating contract below.
+There is no `/contracts/migration-status` endpoint in the API spec yet.
+`fetchContractMigrationStatus()` is the production client for this
+frontend's forward contract for that route; `fetchMockContractMigrationStatus()`
+remains a fixture for local development/tests only and is never wired as the
+default in `ContractMigrationStatusBanner`. When the real route ships, only
+the URL/response parsing in `fetchContractMigrationStatus()` should need to
+change — never the gating contract below.
+
+## Real backend client and polling
+
+`ContractMigrationStatusBanner` (mounted once, unauthenticated, in
+`app/layout.tsx`) fetches on mount via `fetchContractMigrationStatus()` and
+re-checks every `pollIntervalMs` (default 2 minutes) while mounted, with
+conditional (`If-None-Match`) revalidation and `AbortController`-based
+cancellation on unmount/next poll.
+
+**Fail-safe, not fail-closed-to-null:** a poll failure (network error,
+timeout, `401`/`403`, malformed or wrong-network body) never clears a
+previously-known status. If it did, a transient backend outage during an
+active `"migrating"` phase would silently fall back to
+`canPerform(null, "write")` — which is *permissive* — incorrectly
+re-enabling writes that should stay blocked. The last known-good status
+keeps gating reads/writes exactly as before; only its *freshness* degrades.
+
+**Stale data cannot authorize a successor redirect.** `isMigrationStatusFresh()`
+bounds how long a fetched status may be used to offer a successor link
+(`MIGRATION_STATUS_MAX_AGE_MS`, 10 minutes) — tracked independently of
+whether the status itself is still being shown. `ContractMigrationBanner`'s
+`successorTrustAllowed` prop (default `true`, so every existing
+prop-driven caller is unaffected) is what `ContractMigrationStatusBanner`
+sets to `false` once its polled status has aged out: the banner keeps
+rendering the (now stale) phase and keeps gating writes from it, but stops
+offering a redirect to the successor until a poll revalidates it. A
+stale-but-still-verified successor is distinguished in the UI
+(`data-testid="stale-successor-note"`) from one that was never verified at
+all, so the two failure modes are never conflated.
+
+| Situation | Status shown | Writes gated by | Successor link |
+| --- | --- | --- | --- |
+| Backend reachable, status fresh | current | current | offered if verified |
+| Backend unreachable, no status fetched yet | none (banner renders nothing) | not gated (no information) | — |
+| Backend unreachable after a prior successful fetch | last known | last known | withheld once stale, even if verified |
+| Backend returns `304 Not Modified` | last known, revalidated | last known | re-offered (freshness restored) |
 
 ## Deterministic behavior
 

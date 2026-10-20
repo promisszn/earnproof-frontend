@@ -28,6 +28,14 @@ export type CachedCapabilityEntry = {
   document: CapabilityDocument;
   identity: DeploymentIdentity;
   cachedAt: number;
+  /**
+   * ETag of `document`, as returned by the backend, when known. Used to
+   * make a conditional (`If-None-Match`) revalidation request instead of
+   * re-fetching the full body once the TTL below has elapsed. Optional so
+   * entries written by the mock provider (which has no real ETag) remain
+   * well-formed.
+   */
+  etag?: string | null;
 };
 
 function isCachedCapabilityEntry(value: unknown): value is CachedCapabilityEntry {

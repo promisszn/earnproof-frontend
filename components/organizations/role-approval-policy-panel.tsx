@@ -1,18 +1,25 @@
 "use client";
 
 /**
- * Organization role-approval policy configuration (#258).
+ * Organization role-approval policy configuration (#258, connected to the
+ * backend in #309).
  *
- * Loads the current policy (and its version history), lets an OWNER/ADMIN
- * edit it, previews the impact, compares/rolls back to earlier versions, and
- * saves through `applyPolicyUpdate` — which fails closed on stale, conflicting
- * or weakening changes.
+ * Loads the current policy (and its version history) from the backend, lets
+ * an OWNER/ADMIN edit it, previews the impact — first against the pure,
+ * local `summarizePolicyImpact` for live feedback while editing, then
+ * against the server's own preview endpoint right before saving — and
+ * commits a save only once `updateRoleApprovalPolicy` resolves. The panel
+ * never shows "Saved" before that: a conditional write (`If-Match` on the
+ * loaded version) rejected by the server as `409 Conflict` is surfaced as a
+ * stale-version error, and the server's own current policy (carried on the
+ * conflict) is adopted locally so the next attempt is based on real data,
+ * never silently retried or overwritten.
  *
- * Viewers without a management role see a read-only summary. All gating here
- * is UX only; the server re-validates every write.
+ * Viewers without a management role see a read-only summary. All gating
+ * here is UX only; the server re-validates every write.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_ROLE_APPROVAL_MINIMUMS,
   ORGANIZATION_ROLES,
@@ -20,8 +27,13 @@ import {
   buildRollbackDraft,
   canManageRoleApprovalPolicy,
   comparePolicyVersions,
-  fetchMockRoleApprovalPolicy,
+  fetchRoleApprovalPolicy,
+  fetchRoleApprovalPolicyHistory,
+  isRoleApprovalPolicyConflict,
+  isWellFormedRoleApprovalPolicy,
+  previewRoleApprovalPolicyUpdate,
   summarizePolicyImpact,
+  updateRoleApprovalPolicy,
   validateRoleApprovalPolicy,
   type OrganizationRole,
   type RoleApprovalMinimums,
@@ -31,7 +43,14 @@ import {
 export interface RoleApprovalPolicyPanelProps {
   organizationId: string;
   viewerRole: OrganizationRole | null | undefined;
-  /** Pre-loaded policy; when omitted the panel loads its own fixture. */
+  /**
+   * Bearer token for API requests. Without one, management actions are
+   * disabled even for an OWNER/ADMIN `viewerRole` (there is no session to
+   * authenticate the write with) — reads still work if `initialPolicy` was
+   * supplied by the caller.
+   */
+  token?: string | null;
+  /** Pre-loaded policy; when omitted the panel loads it from the backend. */
   initialPolicy?: RoleApprovalPolicy;
   initialHistory?: RoleApprovalPolicy[];
   minimums?: RoleApprovalMinimums;
@@ -41,12 +60,13 @@ export interface RoleApprovalPolicyPanelProps {
 export function RoleApprovalPolicyPanel({
   organizationId,
   viewerRole,
+  token = null,
   initialPolicy,
   initialHistory = [],
   minimums = DEFAULT_ROLE_APPROVAL_MINIMUMS,
   onSaved,
 }: RoleApprovalPolicyPanelProps) {
-  const canManage = canManageRoleApprovalPolicy(viewerRole);
+  const canManage = canManageRoleApprovalPolicy(viewerRole) && Boolean(token);
 
   const [policy, setPolicy] = useState<RoleApprovalPolicy | null>(initialPolicy ?? null);
   const [history, setHistory] = useState<RoleApprovalPolicy[]>(initialHistory);
@@ -54,24 +74,136 @@ export function RoleApprovalPolicyPanel({
   const [compareTarget, setCompareTarget] = useState<number | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const mountedRef = useRef(true);
+  const pendingControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    if (initialPolicy) {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pendingControllerRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (initialPolicy || !token) {
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     void (async () => {
-      const response = await fetchMockRoleApprovalPolicy();
-      if (!cancelled) {
-        setPolicy(response.policy);
-        setDraft(response.policy);
-        setHistory(response.history);
+      try {
+        const [loadedPolicy, loadedHistory] = await Promise.all([
+          fetchRoleApprovalPolicy(token, organizationId, controller.signal),
+          fetchRoleApprovalPolicyHistory(token, organizationId, controller.signal),
+        ]);
+        if (cancelled) return;
+        setPolicy(loadedPolicy);
+        setDraft(loadedPolicy);
+        setHistory(loadedHistory);
+        setLoadError(null);
+      } catch (error) {
+        if (cancelled || (error instanceof DOMException && error.name === "AbortError")) {
+          return;
+        }
+        setLoadError("Could not load the role approval policy. Try again.");
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [initialPolicy]);
+  }, [initialPolicy, organizationId, token]);
+
+  const handleSave = useCallback(async () => {
+    if (!policy || !draft || !token || isSaving) {
+      return;
+    }
+
+    // Cheap client-side pre-check before ever touching the network — never
+    // claims success from this alone.
+    const localPrecheck = applyPolicyUpdate({
+      current: policy,
+      draft,
+      expectedVersion: policy.policyVersion,
+      viewerRole,
+      minimums,
+    });
+    if (!localPrecheck.ok) {
+      setSaveError(localPrecheck.message);
+      setSavedNotice(null);
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+    setSavedNotice(null);
+
+    const controller = new AbortController();
+    pendingControllerRef.current = controller;
+
+    try {
+      const preview = await previewRoleApprovalPolicyUpdate(
+        token,
+        organizationId,
+        policy,
+        draft,
+        controller.signal,
+      );
+      const blockingIssues = preview.issues.filter((issue) => issue.severity === "error");
+      if (blockingIssues.length > 0) {
+        if (mountedRef.current) {
+          setSaveError("This policy would weaken a server-enforced minimum.");
+        }
+        return;
+      }
+
+      const updated = await updateRoleApprovalPolicy(
+        token,
+        organizationId,
+        draft,
+        policy.policyVersion,
+        controller.signal,
+      );
+
+      if (!mountedRef.current) return;
+      setHistory((previous) => [policy, ...previous]);
+      setPolicy(updated);
+      setDraft(updated);
+      setSaveError(null);
+      setSavedNotice(`Saved policy version ${updated.policyVersion}.`);
+      onSaved?.(updated);
+    } catch (error) {
+      if (!mountedRef.current) return;
+      if (error instanceof DOMException && error.name === "AbortError") {
+        return;
+      }
+      if (isRoleApprovalPolicyConflict(error)) {
+        const serverPolicy = error.serverEntity;
+        if (isWellFormedRoleApprovalPolicy(serverPolicy)) {
+          // The server is authoritative: adopt its current version instead
+          // of leaving the editor pointed at data we now know is stale.
+          setPolicy(serverPolicy);
+          setDraft(serverPolicy);
+        }
+        setSaveError(
+          "This policy changed on the server since you loaded it. The latest version has been loaded above — review and save again.",
+        );
+      } else {
+        setSaveError(
+          error instanceof Error ? error.message : "Could not save the policy. Try again.",
+        );
+      }
+    } finally {
+      if (mountedRef.current) {
+        setIsSaving(false);
+      }
+      pendingControllerRef.current = null;
+    }
+  }, [draft, isSaving, minimums, onSaved, organizationId, policy, token, viewerRole]);
 
   const issues = useMemo(
     () => (draft ? validateRoleApprovalPolicy(draft, minimums) : []),
@@ -84,6 +216,23 @@ export function RoleApprovalPolicyPanel({
   );
 
   if (!policy || !draft) {
+    if (loadError) {
+      return (
+        <section
+          className="rounded-lg border border-rose-300/40 bg-rose-300/10 p-5 text-sm text-rose-100"
+          role="alert"
+        >
+          {loadError}
+        </section>
+      );
+    }
+    if (!token) {
+      return (
+        <section className="rounded-lg border border-white/10 bg-white/[0.04] p-5 text-sm text-slate-300">
+          Sign in to view this organization&apos;s role approval policy.
+        </section>
+      );
+    }
     return (
       <section aria-busy="true" className="rounded-lg border border-white/10 bg-white/[0.04] p-5 text-sm text-slate-300">
         Loading role approval policy…
@@ -111,29 +260,6 @@ export function RoleApprovalPolicyPanel({
     setDraft((current) =>
       current ? { ...current, [field]: Number.isNaN(parsed) ? 0 : parsed } : current,
     );
-  };
-
-  const handleSave = () => {
-    const outcome = applyPolicyUpdate({
-      current: policy,
-      draft,
-      expectedVersion: policy.policyVersion,
-      viewerRole,
-      minimums,
-    });
-
-    if (!outcome.ok) {
-      setSaveError(outcome.message);
-      setSavedNotice(null);
-      return;
-    }
-
-    setHistory((previous) => [policy, ...previous]);
-    setPolicy(outcome.policy);
-    setDraft(outcome.policy);
-    setSaveError(null);
-    setSavedNotice(`Saved policy version ${outcome.policy.policyVersion}.`);
-    onSaved?.(outcome.policy);
   };
 
   const handleRollback = (target: RoleApprovalPolicy) => {
@@ -325,14 +451,15 @@ export function RoleApprovalPolicyPanel({
         <div className="flex flex-wrap gap-3">
           <button
             className="h-9 rounded-md bg-cyan-300 px-4 text-xs font-semibold text-slate-950 hover:bg-cyan-200 disabled:opacity-50"
-            disabled={errors.length > 0}
-            onClick={handleSave}
+            disabled={errors.length > 0 || isSaving}
+            onClick={() => void handleSave()}
             type="button"
           >
-            Save policy
+            {isSaving ? "Saving…" : "Save policy"}
           </button>
           <button
             className="h-9 rounded-md border border-white/15 px-4 text-xs font-semibold text-slate-100 hover:bg-white/5"
+            disabled={isSaving}
             onClick={() => {
               setDraft(policy);
               setSaveError(null);

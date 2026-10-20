@@ -18,7 +18,8 @@ import {
 } from "react";
 import {
   currentDeploymentIdentity,
-  fetchMockCapabilityDocument,
+  deploymentIdentityChanged,
+  fetchCapabilityDocument,
   isCapabilityEnabled,
   type CapabilityDocument,
   type CapabilityKey,
@@ -28,9 +29,17 @@ import {
   readCapabilityCache,
   writeCapabilityCache,
   clearCapabilityCache,
+  type CachedCapabilityEntry,
 } from "@/lib/api/capability-cache";
 
-export type CapabilityStatus = "loading" | "ready" | "error";
+/**
+ * `"stale"` means a fetch (initial load or refresh) failed, but a
+ * previously-trusted document for this exact deployment identity is still
+ * being served from cache — status distinguishes this from `"error"`
+ * (no usable document at all) so callers can surface "may be out of date"
+ * without hiding capabilities the user was already, correctly, granted.
+ */
+export type CapabilityStatus = "loading" | "ready" | "stale" | "error";
 
 export type CapabilityContextValue = {
   status: CapabilityStatus;
@@ -42,17 +51,68 @@ export type CapabilityContextValue = {
 
 const CapabilityContext = createContext<CapabilityContextValue | null>(null);
 
-export type CapabilityFetcher = () => Promise<CapabilityDocument>;
+/**
+ * A fetcher may return either a bare document (the shape every existing
+ * test/dev fixture already uses, including `fetchMockCapabilityDocument`)
+ * or `{ document, etag }` so the provider can persist the ETag for
+ * conditional revalidation. This is additive — a bare-document return is
+ * still fully supported.
+ */
+export type CapabilityFetchOutcome =
+  | CapabilityDocument
+  | { document: CapabilityDocument; etag?: string | null };
+
+export type CapabilityFetcher = () => Promise<CapabilityFetchOutcome>;
+
+function unwrapFetchOutcome(outcome: CapabilityFetchOutcome): {
+  document: CapabilityDocument;
+  etag: string | null;
+} {
+  if (outcome && typeof outcome === "object" && "document" in outcome) {
+    return { document: outcome.document, etag: outcome.etag ?? null };
+  }
+  return { document: outcome, etag: null };
+}
+
+/**
+ * Production default: fetches the real capability document from the
+ * backend, revalidating against the locally cached ETag (if the cache is
+ * still for this exact deployment identity) so an unchanged document costs
+ * a `304` instead of a full re-fetch.
+ */
+async function defaultCapabilityFetcher(): Promise<CapabilityFetchOutcome> {
+  const identity = currentDeploymentIdentity();
+  const cached = readCapabilityCache();
+  const canRevalidate = !!cached && !deploymentIdentityChanged(cached.identity, identity);
+
+  const result = await fetchCapabilityDocument({
+    etag: canRevalidate && cached ? cached.etag ?? null : null,
+  });
+
+  if (result.kind === "not-modified") {
+    if (!canRevalidate || !cached) {
+      // The server validated an ETag we no longer have a trusted local
+      // document for — never synthesize a document from thin air.
+      throw new Error("Capability document revalidation had no trusted cached document to reuse.");
+    }
+    return { document: cached.document, etag: cached.etag ?? null };
+  }
+
+  return { document: result.document, etag: result.etag };
+}
 
 export function CapabilityProvider({
   children,
-  fetcher = fetchMockCapabilityDocument,
+  fetcher = defaultCapabilityFetcher,
 }: {
   children: ReactNode;
   /**
-   * Overridable so tests (and, later, a real backend integration) can
-   * supply a different document source without touching this provider.
-   * Defaults to the local mock/stub described in `lib/api/capabilities.ts`.
+   * Overridable so tests can supply a deterministic document source
+   * without touching this provider. Defaults to `defaultCapabilityFetcher`,
+   * which calls the real backend (`fetchCapabilityDocument` in
+   * `lib/api/capabilities.ts`) — production code should not need to pass
+   * this prop at all. `fetchMockCapabilityDocument` remains available for
+   * local development/tests that want the fixture instead.
    */
   fetcher?: CapabilityFetcher;
 }) {
@@ -84,42 +144,58 @@ export function CapabilityProvider({
     async function load() {
       setStatus("loading");
       const identity = currentDeploymentIdentity();
+      const cached = readCapabilityCache();
 
-      if (!skipCache) {
-        const cached = readCapabilityCache();
-        if (cached && isCapabilityCacheFresh(cached, identity)) {
-          if (mountedRef.current) {
-            setDocument(cached.document);
-            setStatus("ready");
-          }
-          return;
+      if (!skipCache && cached && isCapabilityCacheFresh(cached, identity)) {
+        if (mountedRef.current) {
+          setDocument(cached.document);
+          setStatus("ready");
         }
-        if (cached) {
-          // Present but stale/invalidated (deployment identity changed,
-          // or TTL expired) — drop it so a failed refetch below doesn't
-          // leave a stale document readable via a future cache read.
-          clearCapabilityCache();
-        }
+        return;
+      }
+
+      // A cache entry for this *exact* deployment identity (even past its
+      // TTL, or while force-refreshing) is kept as a fail-closed-safe
+      // fallback if the fetch below fails: it was already validated for
+      // this deployment, so re-showing it grants nothing new — it only
+      // avoids hiding already-authorized capabilities behind a transient
+      // network blip. A cache entry for a *different* deployment identity
+      // (different API URL, network, or spec version) is never a safe
+      // fallback and is dropped outright instead.
+      const fallback: CachedCapabilityEntry | null =
+        cached && !deploymentIdentityChanged(cached.identity, identity) ? cached : null;
+      if (cached && !fallback) {
+        clearCapabilityCache();
       }
 
       try {
-        const nextDocument = await fetcher();
+        const outcome = await fetcher();
         if (!mountedRef.current) return;
+        const { document: nextDocument, etag } = unwrapFetchOutcome(outcome);
 
         writeCapabilityCache({
           document: nextDocument,
           identity,
           cachedAt: Date.now(),
+          etag,
         });
         setDocument(nextDocument);
         setStatus("ready");
       } catch {
         if (!mountedRef.current) return;
-        // Fail closed: no document means every `has()` check below
-        // returns false, not "assume previous state" or "assume
-        // enabled".
-        setDocument(null);
-        setStatus("error");
+        if (fallback) {
+          // Fail closed for anything *new*, but don't hide capabilities
+          // already granted under a document that is still trusted for
+          // this deployment — just mark the state explicitly stale.
+          setDocument(fallback.document);
+          setStatus("stale");
+        } else {
+          // No safe fallback: fail closed completely. No document means
+          // every `has()` check below returns false, not "assume previous
+          // state" or "assume enabled".
+          setDocument(null);
+          setStatus("error");
+        }
       }
     }
 
@@ -165,7 +241,11 @@ export function useCapabilities(): CapabilityContextValue {
 /**
  * Convenience hook for a single capability check. Fails closed via
  * `has()` — while `status` is `"loading"` or `"error"`, this returns
- * `false` because `document` is `null` in both of those states.
+ * `false` because `document` is `null` in both of those states. While
+ * `status` is `"stale"`, `has()` evaluates the last known-trusted document
+ * for this deployment rather than `false` — a capability already granted
+ * stays visible during a transient refresh failure, it is never newly
+ * granted by staleness.
  */
 export function useCapability(key: CapabilityKey): {
   enabled: boolean;

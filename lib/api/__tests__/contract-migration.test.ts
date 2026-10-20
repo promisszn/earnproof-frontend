@@ -1,13 +1,19 @@
 import { appConfig } from "@/config/app";
 import {
   CONTRACT_MIGRATION_SCHEMA_VERSION,
+  CONTRACT_MIGRATION_STATUS_PATH,
+  MIGRATION_STATUS_MAX_AGE_MS,
+  MigrationStatusError,
   canPerform,
+  fetchContractMigrationStatus,
   fetchMockContractMigrationStatus,
+  isMigrationStatusFresh,
   isReadOnlyPhase,
   isSafeSuccessorUrl,
   isSuccessorTrusted,
   isSupportedMigrationStatus,
   isValidContractId,
+  isWellFormedMigrationStatus,
   migrationBannerCopy,
   migrationGateReason,
   resolveStatusPageLink,
@@ -250,5 +256,175 @@ describe("contract-migration: status validation + fixture", () => {
   it("honors overrides in the fixture", async () => {
     const fixture = await fetchMockContractMigrationStatus({ phase: "migrating" });
     expect(fixture.phase).toBe("migrating");
+  });
+});
+
+describe("isMigrationStatusFresh — successor-trust freshness boundary", () => {
+  it("is fresh immediately after fetching", () => {
+    expect(isMigrationStatusFresh(Date.now())).toBe(true);
+  });
+
+  it("is fresh right at the boundary just under the max age", () => {
+    expect(isMigrationStatusFresh(Date.now() - (MIGRATION_STATUS_MAX_AGE_MS - 1000))).toBe(true);
+  });
+
+  it("is stale once the max age has elapsed", () => {
+    expect(isMigrationStatusFresh(Date.now() - (MIGRATION_STATUS_MAX_AGE_MS + 1))).toBe(false);
+  });
+
+  it("is stale when fetchedAt is null (never fetched)", () => {
+    expect(isMigrationStatusFresh(null)).toBe(false);
+  });
+
+  it("treats a fetchedAt in the future as stale (clock skew guard)", () => {
+    expect(isMigrationStatusFresh(Date.now() + 60_000)).toBe(false);
+  });
+});
+
+describe("isWellFormedMigrationStatus — runtime shape guard", () => {
+  it("accepts a well-formed status", () => {
+    expect(isWellFormedMigrationStatus(status())).toBe(true);
+  });
+
+  it("accepts a well-formed status with a well-formed successor", () => {
+    expect(
+      isWellFormedMigrationStatus(
+        status({
+          successor: { contractId: OTHER_CONTRACT_ID, verified: true, label: "v2" },
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects non-objects and missing fields", () => {
+    expect(isWellFormedMigrationStatus(null)).toBe(false);
+    expect(isWellFormedMigrationStatus({ phase: "stable" })).toBe(false);
+  });
+
+  it("rejects an invalid phase", () => {
+    expect(isWellFormedMigrationStatus({ ...status(), phase: "not-a-phase" })).toBe(false);
+  });
+
+  it("rejects a successor with the wrong field types", () => {
+    expect(
+      isWellFormedMigrationStatus({
+        ...status(),
+        successor: { contractId: OTHER_CONTRACT_ID, verified: "yes" },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("fetchContractMigrationStatus — real backend client", () => {
+  const originalFetch = global.fetch;
+
+  function mockResponse(init: {
+    ok: boolean;
+    status: number;
+    json?: () => Promise<unknown>;
+    etag?: string | null;
+  }): Response {
+    return {
+      ok: init.ok,
+      status: init.status,
+      json: init.json ?? (async () => ({})),
+      headers: { get: (name: string) => (name.toLowerCase() === "etag" ? init.etag ?? null : null) },
+    } as unknown as Response;
+  }
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("requests the documented path, unauthenticated, against the configured API URL", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      mockResponse({ ok: true, status: 200, json: async () => status() }),
+    );
+
+    await fetchContractMigrationStatus();
+
+    const [url] = (global.fetch as jest.Mock).mock.calls[0];
+    expect(url).toBe(`${appConfig.apiUrl}${CONTRACT_MIGRATION_STATUS_PATH}`);
+  });
+
+  it("returns a fresh, trusted status with its ETag on 200", async () => {
+    const served = status({ phase: "migrating" });
+    global.fetch = jest.fn().mockResolvedValue(
+      mockResponse({ ok: true, status: 200, json: async () => served, etag: '"m1"' }),
+    );
+
+    const result = await fetchContractMigrationStatus();
+
+    expect(result).toEqual({ kind: "fresh", status: served, etag: '"m1"' });
+  });
+
+  it("surfaces a 304 as 'not-modified' without synthesizing a status", async () => {
+    global.fetch = jest.fn().mockResolvedValue(mockResponse({ ok: false, status: 304 }));
+
+    const result = await fetchContractMigrationStatus({ etag: '"m1"' });
+
+    expect(result).toEqual({ kind: "not-modified" });
+  });
+
+  it("fails closed with reason 'unauthorized' on 401/403", async () => {
+    global.fetch = jest.fn().mockResolvedValue(mockResponse({ ok: false, status: 403 }));
+
+    const error = await fetchContractMigrationStatus().catch((caught) => caught);
+    expect(error).toBeInstanceOf(MigrationStatusError);
+    expect((error as InstanceType<typeof MigrationStatusError>).reason).toBe("unauthorized");
+  });
+
+  it("fails closed with reason 'network' on a 5xx response", async () => {
+    global.fetch = jest.fn().mockResolvedValue(mockResponse({ ok: false, status: 502 }));
+
+    const error = await fetchContractMigrationStatus().catch((caught) => caught);
+    expect(error).toBeInstanceOf(MigrationStatusError);
+    expect((error as InstanceType<typeof MigrationStatusError>).reason).toBe("network");
+  });
+
+  it("fails closed with reason 'malformed' for a structurally invalid body", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      mockResponse({ ok: true, status: 200, json: async () => ({ not: "a migration status" }) }),
+    );
+
+    const error = await fetchContractMigrationStatus().catch((caught) => caught);
+    expect(error).toBeInstanceOf(MigrationStatusError);
+    expect((error as InstanceType<typeof MigrationStatusError>).reason).toBe("malformed");
+  });
+
+  it("fails closed with reason 'untrusted' for a well-formed status on a different network", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      mockResponse({ ok: true, status: 200, json: async () => status({ network: "public" }) }),
+    );
+
+    const error = await fetchContractMigrationStatus().catch((caught) => caught);
+    expect(error).toBeInstanceOf(MigrationStatusError);
+    expect((error as InstanceType<typeof MigrationStatusError>).reason).toBe("untrusted");
+  });
+
+  it("fails closed with reason 'network' when the underlying fetch rejects", async () => {
+    global.fetch = jest.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+
+    const error = await fetchContractMigrationStatus().catch((caught) => caught);
+    expect(error).toBeInstanceOf(MigrationStatusError);
+    expect((error as InstanceType<typeof MigrationStatusError>).reason).toBe("network");
+  });
+
+  it("propagates cancellation (AbortError) rather than wrapping it", async () => {
+    const controller = new AbortController();
+    global.fetch = jest.fn().mockImplementation(
+      () =>
+        new Promise((_, reject) => {
+          controller.signal.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        }),
+    );
+
+    const pending = fetchContractMigrationStatus({ signal: controller.signal });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

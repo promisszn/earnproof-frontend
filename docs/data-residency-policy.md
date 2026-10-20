@@ -1,8 +1,11 @@
 # Organization data residency policy
 
-Implements [#277](https://github.com/veridatum-labs/earnproof-frontend/issues/277):
-organizations need to review the allowed storage and processing regions for
-regulated data classes and background jobs.
+Implements [#277](https://github.com/veridatum-labs/earnproof-frontend/issues/277)
+(organizations need to review the allowed storage and processing regions for
+regulated data classes and background jobs) and
+[#310](https://github.com/veridatum-labs/earnproof-frontend/issues/310)
+(connecting that editor to the live backend instead of a client-local mock,
+with tenant-scoped caching and rollout-status polling).
 
 ## Where it lives
 
@@ -65,3 +68,56 @@ placement (or a region removal) while that class's migration is incomplete.
   (`buildResidencyRollbackDraft` — versioned and re-validated as a new change).
 
 Read-only roles (MEMBER/VIEWER) see the same information with controls disabled.
+A `token` prop is also required for management actions — without one,
+`canManageDataResidencyPolicy()` is overridden to read-only regardless of
+`viewerRole`, since there is no session to authenticate a write with.
+
+## Real backend client, tenant-scoped caching, and rollout polling (#310)
+
+`lib/api/organization-data-residency.ts` exports real network calls against
+`/organizations/{organizationId}/data-residency-policy` (not yet in
+`lib/api/openapi/earnproof-api.v1.json` — this frontend's forward contract
+for it), reusing the same `apiClient`/`bearer`/`retryRead`/`retryMutation`
+conventions as `lib/api/organizations.ts` and
+`lib/api/organization-role-approval-policy.ts`:
+
+| Call | Method | Purpose |
+| --- | --- | --- |
+| `fetchDataResidencyPolicy` | `GET .../data-residency-policy` (+ `GET .../history`) | Current policy + version history, tenant-cache-aware |
+| `previewResidencyPolicyUpdate` | `POST .../preview` | Server-side validation/blockers, merged with local `validateResidencyPolicy`/`computeMigrationBlockers` |
+| `updateDataResidencyPolicy` | `PUT ...` (`If-Match: <expectedVersion>`) | Conditional write; invalidates this organization's cache on success |
+| `fetchDataResidencyRolloutStatus` | `GET .../rollout-status` | Just `migration`/`rollout`/`serverValidation`, polled independently of a full policy reload |
+
+`fetchMockDataResidencyPolicy` remains a fixture for local
+development/tests only and is never wired as the default in
+`DataResidencyPolicyPanel` — mock data never ships in production.
+
+**Tenant-scoped caching.** `getCachedDataResidencyPolicy`/
+`setCachedDataResidencyPolicy`/`invalidateDataResidencyPolicyCache` keep an
+in-memory (never persisted) `Map` keyed by `organizationId`, each entry also
+stamped with the deployment identity (`apiUrl`/`network`/`apiSpecVersion`,
+from `lib/api/capabilities.ts`) it was fetched under. A read is only served
+from cache when both the organization and the deployment identity match the
+current one *and* the entry is within `DATA_RESIDENCY_CACHE_TTL_MS` (2
+minutes) — an environment switch or a TTL expiry falls back to the network,
+never a stale or cross-tenant entry.
+
+**Organization switches invalidate state in the UI, not just the cache.**
+`DataResidencyPolicyPanel` resets its local `policy`/`draft`/`history` the
+moment its `organizationId` prop changes (using the "adjust state during
+render" pattern, so the previous organization's policy is never even
+painted for one frame) and reloads from scratch.
+
+**Rollout-status polling.** While mounted and holding a `token`, the panel
+polls `fetchDataResidencyRolloutStatus` every 30 seconds and merges just
+`migration`/`rollout`/`serverValidation` into the current policy — a
+long-running region migration's progress (and therefore
+`computeComplianceStatus()`'s verdict) stays current without a full policy
+reload, and without disturbing `placements`/`backgroundJobRegion`/
+`policyVersion`.
+
+**The UI never claims a save succeeded before the server confirms it,** and
+a stale write is rejected, not silently overwritten: the same
+pre-check → server preview → conditional update → adopt-the-server's-
+current-entity-on-409 flow documented in `docs/role-approval-policy.md`
+applies here via `isDataResidencyPolicyConflict`/`ApiConflictError`.

@@ -5,13 +5,17 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import EmbedVerifyPage from "../page";
 import { fetchWidgetVerification } from "@/lib/api/verification-widget";
-import { fetchMockCapabilityDocument, CAPABILITY_DOCUMENT_SHAPE_VERSION } from "@/lib/api/capabilities";
+import { fetchCapabilityDocument, CAPABILITY_DOCUMENT_SHAPE_VERSION } from "@/lib/api/capabilities";
 import { API_SPEC_VERSION } from "@/lib/api/generated/v1";
 import type { VerifyProofResponse } from "@/lib/api/generated/v1";
 
+// `CapabilityProvider`'s default fetcher is now `fetchCapabilityDocument`
+// (the real backend client, #307) rather than the local mock fixture — see
+// `lib/capabilities/capability-context.tsx`. Mocking it here is what makes
+// these tests deterministic without a real `/capabilities` endpoint.
 jest.mock("@/lib/api/capabilities", () => ({
   ...jest.requireActual("@/lib/api/capabilities"),
-  fetchMockCapabilityDocument: jest.fn(),
+  fetchCapabilityDocument: jest.fn(),
 }));
 
 jest.mock("@/lib/api/verification-widget", () => ({
@@ -19,8 +23,8 @@ jest.mock("@/lib/api/verification-widget", () => ({
   fetchWidgetVerification: jest.fn(),
 }));
 
-const mockedFetchCapabilities = fetchMockCapabilityDocument as jest.MockedFunction<
-  typeof fetchMockCapabilityDocument
+const mockedFetchCapabilityDocument = fetchCapabilityDocument as jest.MockedFunction<
+  typeof fetchCapabilityDocument
 >;
 const mockedFetchWidget = fetchWidgetVerification as jest.MockedFunction<
   typeof fetchWidgetVerification
@@ -28,21 +32,25 @@ const mockedFetchWidget = fetchWidgetVerification as jest.MockedFunction<
 
 const VALID_RESULT: VerifyProofResponse = { result: "VALID", status: "valid" };
 
-function enabledCapabilities() {
+function enabledCapabilitiesResult() {
   return {
-    documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
-    apiVersion: API_SPEC_VERSION,
-    network: "testnet",
-    generatedAt: new Date().toISOString(),
-    capabilities: { "embeddable-verification-widget": { enabled: true } },
+    kind: "fresh" as const,
+    etag: null,
+    document: {
+      documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
+      apiVersion: API_SPEC_VERSION,
+      network: "testnet",
+      generatedAt: new Date().toISOString(),
+      capabilities: { "embeddable-verification-widget": { enabled: true } },
+    },
   };
 }
 
 beforeEach(() => {
   window.localStorage.clear();
-  mockedFetchCapabilities.mockReset();
+  mockedFetchCapabilityDocument.mockReset();
   mockedFetchWidget.mockReset();
-  mockedFetchCapabilities.mockResolvedValue(enabledCapabilities());
+  mockedFetchCapabilityDocument.mockResolvedValue(enabledCapabilitiesResult());
   mockedFetchWidget.mockResolvedValue({ kind: "result", response: VALID_RESULT });
 });
 
@@ -62,7 +70,7 @@ describe("EmbedVerifyPage", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Invalid verification link");
     expect(mockedFetchWidget).not.toHaveBeenCalled();
-    expect(mockedFetchCapabilities).not.toHaveBeenCalled();
+    expect(mockedFetchCapabilityDocument).not.toHaveBeenCalled();
   });
 
   it("renders an inline invalid-link state for an empty id", () => {

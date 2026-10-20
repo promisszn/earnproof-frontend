@@ -10,12 +10,14 @@ export const metadata = {
 };
 
 /**
- * Role approval policy configuration (#258).
+ * Role approval policy configuration (#258, connected to the backend in #309).
  *
- * The viewer's effective organization role is wired through once the
- * organization session is available; until then this route renders the
- * management view, and the panel itself still fails closed for any
- * non-manager role it is given.
+ * The viewer's effective organization role/token is wired through once the
+ * organization session is available at this route (`AuthSessionProvider` is
+ * not yet mounted anywhere above it in `app/`, tracked separately from
+ * #309's scope); until then this route renders the panel without a `token`,
+ * which now correctly shows a "sign in" read-only state instead of a fully
+ * editable management UI with nothing real behind it.
  */
 export default function RoleApprovalPolicyPage() {
   return (

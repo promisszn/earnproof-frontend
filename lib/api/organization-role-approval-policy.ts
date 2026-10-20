@@ -1,12 +1,12 @@
 /**
- * Organization role-approval policy (#258).
- * =========================================
+ * Organization role-approval policy (#258, connected to the backend in #309).
+ * =============================================================================
  *
  * Organizations need to configure which role changes require independent
  * approval, how many approvals are needed, and how long a pending request
  * stays valid.
  *
- * The rules here are deliberately split into three layers:
+ * The rules here are deliberately split into layers:
  *
  *   1. **Server-enforced minimums** (`RoleApprovalMinimums`) — the client may
  *      make a policy *stricter* than these, never weaker. The server
@@ -15,11 +15,21 @@
  *   2. **Policy validation** (`validateRoleApprovalPolicy`) — pure, so the
  *      same result is visible in the editor, the tests, and the server.
  *   3. **Fail-closed apply** (`applyPolicyUpdate`) — a stale (replayed) or
- *      conflicting version is rejected rather than silently overwritten.
+ *      conflicting version is rejected rather than silently overwritten, as
+ *      a cheap client-side pre-check before ever reaching the network.
+ *   4. **The real backend client** (`fetchRoleApprovalPolicy`,
+ *      `fetchRoleApprovalPolicyHistory`, `previewRoleApprovalPolicyUpdate`,
+ *      `updateRoleApprovalPolicy`) — the only place a write is ever actually
+ *      committed. `fetchMockRoleApprovalPolicy` remains a fixture for local
+ *      development/tests and is never wired as the default in
+ *      `RoleApprovalPolicyPanel`.
  *
  * Nothing in this module is an authorization boundary: it never grants a
- * permission, it only refuses to *offer* a weakening change.
+ * permission, it only refuses to *offer* (or locally claim success for) a
+ * change the server hasn't actually confirmed.
  */
+
+import { ApiConflictError, apiClient, bearer, retryMutation, retryRead } from "@/lib/api/client";
 
 export const ROLE_APPROVAL_POLICY_SCHEMA_VERSION = 1;
 
@@ -506,16 +516,175 @@ export function defaultRoleApprovalPolicy(): RoleApprovalPolicy {
   };
 }
 
-/**
- * Fixture/forward-contract provider for the (not-yet-existing) policy
- * endpoint. `history` is returned alongside the current policy so the UI can
- * render version comparison and rollback without a second call.
- */
 export type RoleApprovalPolicyResponse = {
   policy: RoleApprovalPolicy;
   history: RoleApprovalPolicy[];
 };
 
+/**
+ * Real role-approval-policy client (#309).
+ * ==========================================
+ * Authenticated read/preview/update/history calls against
+ * `/organizations/{organizationId}/role-approval-policy`. Not yet in
+ * `lib/api/openapi/earnproof-api.v1.json`; this is this frontend's forward
+ * contract for it, reusing the same `apiClient`/`bearer`/`retryRead`/
+ * `retryMutation` conventions as `lib/api/organizations.ts`.
+ *
+ * Writes are conditional: `updateRoleApprovalPolicy` sends the draft's base
+ * version as `If-Match`, and the server is expected to reject a stale write
+ * with `409 Conflict` — which `apiClient` already normalizes into
+ * `ApiConflictError` (see `lib/api/client.ts`). The panel never claims a save
+ * succeeded locally; it only commits the server's own response.
+ */
+function roleApprovalPolicyPath(organizationId: string): string {
+  return `/organizations/${encodeURIComponent(organizationId)}/role-approval-policy`;
+}
+
+/**
+ * Runtime shape guard for a parsed server response. Rejects a structurally
+ * invalid or wrong-schema-version body before it can reach any pure
+ * function below as if it were trustworthy.
+ */
+export function isWellFormedRoleApprovalPolicy(value: unknown): value is RoleApprovalPolicy {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<RoleApprovalPolicy>;
+  if (candidate.schemaVersion !== ROLE_APPROVAL_POLICY_SCHEMA_VERSION) return false;
+  if (!Number.isInteger(candidate.policyVersion)) return false;
+  if (typeof candidate.updatedAt !== "string") return false;
+  if (!Array.isArray(candidate.rules)) return false;
+  for (const rule of candidate.rules) {
+    if (!rule || typeof rule !== "object") return false;
+    if (!isOrganizationRole((rule as RoleApprovalRule).role)) return false;
+    if (typeof (rule as RoleApprovalRule).requiresApproval !== "boolean") return false;
+  }
+  if (!Number.isFinite(candidate.approvalsRequired)) return false;
+  if (!Number.isFinite(candidate.requestValidityHours)) return false;
+  if (typeof candidate.allowSelfApproval !== "boolean") return false;
+  return true;
+}
+
+/** GET the current policy for `organizationId`. */
+export async function fetchRoleApprovalPolicy(
+  token: string,
+  organizationId: string,
+  signal: AbortSignal,
+): Promise<RoleApprovalPolicy> {
+  return retryRead(async (innerSignal) => {
+    const policy = await apiClient<RoleApprovalPolicy>({
+      path: roleApprovalPolicyPath(organizationId),
+      method: "GET",
+      headers: bearer(token),
+      signal: innerSignal,
+    });
+    if (!isWellFormedRoleApprovalPolicy(policy)) {
+      throw new Error("The role approval policy response was malformed.");
+    }
+    return policy;
+  }, signal);
+}
+
+/** GET the policy's version history for `organizationId`, newest first. */
+export async function fetchRoleApprovalPolicyHistory(
+  token: string,
+  organizationId: string,
+  signal: AbortSignal,
+): Promise<RoleApprovalPolicy[]> {
+  return retryRead(async (innerSignal) => {
+    const history = await apiClient<unknown>({
+      path: `${roleApprovalPolicyPath(organizationId)}/history`,
+      method: "GET",
+      headers: bearer(token),
+      signal: innerSignal,
+    });
+    if (!Array.isArray(history)) {
+      throw new Error("The role approval policy history response was malformed.");
+    }
+    // A malformed individual entry is dropped rather than failing the whole
+    // history list — version comparison/rollback simply won't offer it.
+    return history.filter(isWellFormedRoleApprovalPolicy);
+  }, signal);
+}
+
+export type RoleApprovalPolicyPreview = {
+  /** Client + server validation issues, merged. Non-empty means not submittable. */
+  issues: PolicyValidationIssue[];
+  impact: PolicyImpactSummary;
+};
+
+/**
+ * Requests a server-side preview of applying `draft` on top of `current`.
+ * The server is authoritative for minimums the client might not know about
+ * (e.g. an org-specific policy floor); the client's own `validateRoleApprovalPolicy`
+ * still runs too, so an unreachable preview endpoint doesn't block catching
+ * basic shape problems. This call never mutates anything server-side.
+ */
+export async function previewRoleApprovalPolicyUpdate(
+  token: string,
+  organizationId: string,
+  current: RoleApprovalPolicy,
+  draft: RoleApprovalPolicy,
+  signal: AbortSignal,
+): Promise<RoleApprovalPolicyPreview> {
+  return retryRead(async (innerSignal) => {
+    const response = await apiClient<{ issues?: PolicyValidationIssue[] }>({
+      path: `${roleApprovalPolicyPath(organizationId)}/preview`,
+      method: "POST",
+      headers: bearer(token),
+      body: JSON.stringify({ draft, expectedVersion: current.policyVersion }),
+      signal: innerSignal,
+    });
+    const serverIssues = Array.isArray(response?.issues) ? response.issues : [];
+    return {
+      issues: [...validateRoleApprovalPolicy(draft), ...serverIssues],
+      impact: summarizePolicyImpact(current, draft),
+    };
+  }, signal);
+}
+
+/**
+ * Submits `draft` as the new policy, conditional on the server's version
+ * still matching `expectedVersion` (sent as `If-Match`). A stale write is
+ * rejected by the server with `409 Conflict`, surfaced by `apiClient` as
+ * `ApiConflictError` — callers should catch that specifically to show the
+ * server's current entity rather than silently retrying or overwriting it.
+ * Returns the server's own resulting policy; nothing is applied locally
+ * until this resolves.
+ */
+export async function updateRoleApprovalPolicy(
+  token: string,
+  organizationId: string,
+  draft: RoleApprovalPolicy,
+  expectedVersion: number,
+  signal: AbortSignal,
+): Promise<RoleApprovalPolicy> {
+  return retryMutation(async (innerSignal) => {
+    const updated = await apiClient<RoleApprovalPolicy>({
+      path: roleApprovalPolicyPath(organizationId),
+      method: "PUT",
+      headers: { ...bearer(token), "If-Match": String(expectedVersion) },
+      body: JSON.stringify(draft),
+      signal: innerSignal,
+    });
+    if (!isWellFormedRoleApprovalPolicy(updated)) {
+      throw new Error("The role approval policy response was malformed after update.");
+    }
+    return updated;
+  }, signal);
+}
+
+/** True for the one error shape `updateRoleApprovalPolicy` can throw that means "stale write". */
+export function isRoleApprovalPolicyConflict(error: unknown): error is ApiConflictError {
+  return error instanceof ApiConflictError;
+}
+
+/**
+ * Fixture/forward-contract provider for local development and tests only —
+ * never wired as the default in `RoleApprovalPolicyPanel`. `history` is
+ * returned alongside the current policy so the UI can render version
+ * comparison and rollback without a second call, mirroring what the real
+ * `fetchRoleApprovalPolicy` + `fetchRoleApprovalPolicyHistory` calls
+ * together provide.
+ */
 export async function fetchMockRoleApprovalPolicy(
   overrides: Partial<RoleApprovalPolicy> = {},
   history: RoleApprovalPolicy[] = [],

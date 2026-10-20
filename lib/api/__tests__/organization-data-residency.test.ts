@@ -1,15 +1,26 @@
+import { ApiConflictError } from "@/lib/api/client";
 import {
+  DATA_RESIDENCY_CACHE_TTL_MS,
   DATA_RESIDENCY_POLICY_SCHEMA_VERSION,
   applyResidencyUpdate,
   compareResidencyVersions,
   computeComplianceStatus,
   computeMigrationBlockers,
   defaultDataResidencyPolicy,
+  fetchDataResidencyPolicy,
+  fetchDataResidencyRolloutStatus,
   fetchMockDataResidencyPolicy,
+  getCachedDataResidencyPolicy,
   getRegionCapability,
+  invalidateDataResidencyPolicyCache,
+  isDataResidencyPolicyConflict,
   isRegionSupportedForClass,
   isResidencyPolicyValid,
+  isWellFormedDataResidencyPolicy,
+  previewResidencyPolicyUpdate,
+  setCachedDataResidencyPolicy,
   summarizeResidencyImpact,
+  updateDataResidencyPolicy,
   validateResidencyPolicy,
   type DataResidencyPolicy,
 } from "../organization-data-residency";
@@ -255,5 +266,215 @@ describe("data-residency: fixture", () => {
   it("honors overrides", async () => {
     const response = await fetchMockDataResidencyPolicy({ policyVersion: 7 });
     expect(response.policy.policyVersion).toBe(7);
+  });
+});
+
+describe("isWellFormedDataResidencyPolicy — runtime shape guard", () => {
+  it("accepts a well-formed policy", () => {
+    expect(isWellFormedDataResidencyPolicy(policy())).toBe(true);
+  });
+
+  it("rejects non-objects and an unsupported schema version", () => {
+    expect(isWellFormedDataResidencyPolicy(null)).toBe(false);
+    expect(isWellFormedDataResidencyPolicy(policy({ schemaVersion: 2 }))).toBe(false);
+  });
+
+  it("rejects an invalid serverValidation/rollout status", () => {
+    expect(
+      isWellFormedDataResidencyPolicy({ ...policy(), serverValidation: "maybe" }),
+    ).toBe(false);
+    expect(
+      isWellFormedDataResidencyPolicy({ ...policy(), rollout: { status: "unknown" } }),
+    ).toBe(false);
+  });
+});
+
+describe("tenant-scoped in-memory cache", () => {
+  afterEach(() => {
+    invalidateDataResidencyPolicyCache();
+  });
+
+  it("round-trips a cached entry for one organization", () => {
+    const response = { policy: policy(), history: [] };
+    setCachedDataResidencyPolicy("org-a", response);
+    expect(getCachedDataResidencyPolicy("org-a")).toEqual(response);
+  });
+
+  it("never serves one organization's cache entry for another (tenant scoping)", () => {
+    setCachedDataResidencyPolicy("org-a", { policy: policy({ policyVersion: 1 }), history: [] });
+    expect(getCachedDataResidencyPolicy("org-b")).toBeNull();
+  });
+
+  it("expires after the TTL", () => {
+    const response = { policy: policy(), history: [] };
+    const cachedAt = Date.now() - (DATA_RESIDENCY_CACHE_TTL_MS + 1);
+    setCachedDataResidencyPolicy("org-a", response, cachedAt);
+    expect(getCachedDataResidencyPolicy("org-a")).toBeNull();
+  });
+
+  it("is fresh right at the boundary just under the TTL", () => {
+    const response = { policy: policy(), history: [] };
+    const cachedAt = Date.now() - (DATA_RESIDENCY_CACHE_TTL_MS - 1000);
+    setCachedDataResidencyPolicy("org-a", response, cachedAt);
+    expect(getCachedDataResidencyPolicy("org-a")).toEqual(response);
+  });
+
+  it("invalidateDataResidencyPolicyCache(id) clears only that organization", () => {
+    setCachedDataResidencyPolicy("org-a", { policy: policy(), history: [] });
+    setCachedDataResidencyPolicy("org-b", { policy: policy(), history: [] });
+    invalidateDataResidencyPolicyCache("org-a");
+    expect(getCachedDataResidencyPolicy("org-a")).toBeNull();
+    expect(getCachedDataResidencyPolicy("org-b")).not.toBeNull();
+  });
+
+  it("invalidateDataResidencyPolicyCache() with no argument clears every organization", () => {
+    setCachedDataResidencyPolicy("org-a", { policy: policy(), history: [] });
+    setCachedDataResidencyPolicy("org-b", { policy: policy(), history: [] });
+    invalidateDataResidencyPolicyCache();
+    expect(getCachedDataResidencyPolicy("org-a")).toBeNull();
+    expect(getCachedDataResidencyPolicy("org-b")).toBeNull();
+  });
+});
+
+describe("real backend client — read/preview/update/rollout-status", () => {
+  const originalFetch = global.fetch;
+  const ORG_ID = "org-77";
+  const TOKEN = "test-token";
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+      headers: { get: () => null },
+    } as unknown as Response;
+  }
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    invalidateDataResidencyPolicyCache();
+    jest.restoreAllMocks();
+  });
+
+  it("fetchDataResidencyPolicy reads policy + history and populates the tenant cache", async () => {
+    const served = policy({ policyVersion: 2 });
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/history")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse(served));
+    });
+
+    const result = await fetchDataResidencyPolicy(TOKEN, ORG_ID, new AbortController().signal);
+
+    expect(result.policy).toEqual(served);
+    expect(getCachedDataResidencyPolicy(ORG_ID)).toEqual(result);
+  });
+
+  it("fetchDataResidencyPolicy serves the tenant cache without calling the network again", async () => {
+    const served = policy({ policyVersion: 2 });
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/history")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse(served));
+    });
+
+    await fetchDataResidencyPolicy(TOKEN, ORG_ID, new AbortController().signal);
+    (global.fetch as jest.Mock).mockClear();
+    const second = await fetchDataResidencyPolicy(TOKEN, ORG_ID, new AbortController().signal);
+
+    expect(second.policy).toEqual(served);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("fetchDataResidencyPolicy rejects a malformed response rather than caching it", async () => {
+    global.fetch = jest.fn().mockImplementation((url: string) => {
+      if (url.endsWith("/history")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse({ not: "a policy" }));
+    });
+
+    await expect(
+      fetchDataResidencyPolicy(TOKEN, ORG_ID, new AbortController().signal),
+    ).rejects.toThrow(/malformed/i);
+    expect(getCachedDataResidencyPolicy(ORG_ID)).toBeNull();
+  });
+
+  it("previewResidencyPolicyUpdate merges server-reported blockers with locally computed ones", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      jsonResponse({ issues: [], blockers: [{ dataClass: "proofs", region: "us-east", message: "server blocker" }] }),
+    );
+
+    const current = policy();
+    const draft = policy({ placements: { ...policy().placements, backups: ["eu-west"] } });
+
+    const preview = await previewResidencyPolicyUpdate(TOKEN, ORG_ID, current, draft, new AbortController().signal);
+
+    expect(preview.blockers.some((blocker) => blocker.message === "server blocker")).toBe(true);
+  });
+
+  it("updateDataResidencyPolicy sends If-Match, invalidates the tenant cache, and returns the server's result", async () => {
+    setCachedDataResidencyPolicy(ORG_ID, { policy: policy(), history: [] });
+    const updated = policy({ policyVersion: 2 });
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(updated));
+
+    const result = await updateDataResidencyPolicy(
+      TOKEN,
+      ORG_ID,
+      policy({ policyVersion: 2 }),
+      1,
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual(updated);
+    expect(getCachedDataResidencyPolicy(ORG_ID)).toBeNull();
+    const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+    expect((init.headers as Record<string, string>)["If-Match"]).toBe("1");
+    expect(init.method).toBe("PUT");
+  });
+
+  it("updateDataResidencyPolicy surfaces a 409 as ApiConflictError carrying the server's current entity", async () => {
+    const serverCurrent = policy({ policyVersion: 9 });
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ message: "stale", currentEntity: serverCurrent, submittedData: {} }),
+      headers: { get: () => null },
+    } as unknown as Response);
+
+    const error = await updateDataResidencyPolicy(
+      TOKEN,
+      ORG_ID,
+      policy({ policyVersion: 2 }),
+      1,
+      new AbortController().signal,
+    ).catch((caught) => caught);
+
+    expect(isDataResidencyPolicyConflict(error)).toBe(true);
+    expect((error as ApiConflictError).serverEntity).toEqual(serverCurrent);
+  });
+
+  it("fetchDataResidencyRolloutStatus reads just migration/rollout/serverValidation", async () => {
+    const status = {
+      migration: policy().migration,
+      rollout: { status: "in-progress" as const },
+      serverValidation: "accepted" as const,
+    };
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(status));
+
+    const result = await fetchDataResidencyRolloutStatus(TOKEN, ORG_ID, new AbortController().signal);
+
+    expect(result).toEqual(status);
+    const [url] = (global.fetch as jest.Mock).mock.calls[0];
+    expect(url).toContain("/rollout-status");
+  });
+
+  it("fetchDataResidencyRolloutStatus rejects a malformed response", async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ not: "a status" }));
+
+    await expect(
+      fetchDataResidencyRolloutStatus(TOKEN, ORG_ID, new AbortController().signal),
+    ).rejects.toThrow(/malformed/i);
+  });
+
+  it("isDataResidencyPolicyConflict is false for every other error shape", () => {
+    expect(isDataResidencyPolicyConflict(new Error("network down"))).toBe(false);
+    expect(isDataResidencyPolicyConflict(null)).toBe(false);
   });
 });

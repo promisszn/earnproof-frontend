@@ -10,11 +10,15 @@ export const metadata = {
 };
 
 /**
- * Organization data residency policy controls (#277).
+ * Organization data residency policy controls (#277, connected to the
+ * backend in #310).
  *
- * The viewer's effective organization role is wired through once the
- * organization session is available; until then this route renders the
- * management view, and the panel still fails closed for any non-manager role.
+ * The viewer's effective organization role/token is wired through once the
+ * organization session is available at this route (`AuthSessionProvider` is
+ * not yet mounted anywhere above it in `app/`, tracked separately from
+ * #310's scope); until then this route renders the panel without a `token`,
+ * which now correctly shows a "sign in" read-only state instead of a fully
+ * editable management UI with nothing real behind it.
  */
 export default function DataResidencyPolicyPage() {
   return (

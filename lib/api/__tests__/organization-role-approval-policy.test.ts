@@ -1,3 +1,4 @@
+import { ApiConflictError } from "@/lib/api/client";
 import {
   DEFAULT_ROLE_APPROVAL_MINIMUMS,
   ROLE_APPROVAL_POLICY_SCHEMA_VERSION,
@@ -7,9 +8,15 @@ import {
   comparePolicyVersions,
   defaultRoleApprovalPolicy,
   fetchMockRoleApprovalPolicy,
+  fetchRoleApprovalPolicy,
+  fetchRoleApprovalPolicyHistory,
   isPolicyAtLeastAsStrict,
+  isRoleApprovalPolicyConflict,
   isRoleApprovalPolicyValid,
+  isWellFormedRoleApprovalPolicy,
+  previewRoleApprovalPolicyUpdate,
   summarizePolicyImpact,
+  updateRoleApprovalPolicy,
   validateRoleApprovalPolicy,
   type RoleApprovalPolicy,
 } from "../organization-role-approval-policy";
@@ -299,5 +306,152 @@ describe("role-approval-policy: rollback + fixture", () => {
     );
     expect(response.policy.approvalsRequired).toBe(3);
     expect(response.history).toHaveLength(1);
+  });
+});
+
+describe("isWellFormedRoleApprovalPolicy — runtime shape guard", () => {
+  it("accepts a well-formed policy", () => {
+    expect(isWellFormedRoleApprovalPolicy(policy())).toBe(true);
+  });
+
+  it("rejects non-objects and an unsupported schema version", () => {
+    expect(isWellFormedRoleApprovalPolicy(null)).toBe(false);
+    expect(isWellFormedRoleApprovalPolicy(policy({ schemaVersion: 2 }))).toBe(false);
+  });
+
+  it("rejects a non-integer policyVersion", () => {
+    expect(isWellFormedRoleApprovalPolicy({ ...policy(), policyVersion: 1.5 })).toBe(false);
+  });
+
+  it("rejects a rule with an unknown role or wrong field types", () => {
+    expect(
+      isWellFormedRoleApprovalPolicy({
+        ...policy(),
+        rules: [{ role: "NOT-A-ROLE", requiresApproval: true }],
+      }),
+    ).toBe(false);
+    expect(
+      isWellFormedRoleApprovalPolicy({
+        ...policy(),
+        rules: [{ role: "OWNER", requiresApproval: "yes" }],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("real backend client — read/preview/update/history", () => {
+  const originalFetch = global.fetch;
+  const ORG_ID = "org-42";
+  const TOKEN = "test-token";
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+      headers: { get: () => null },
+    } as unknown as Response;
+  }
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.restoreAllMocks();
+  });
+
+  it("fetchRoleApprovalPolicy reads from /organizations/{id}/role-approval-policy with a bearer token", async () => {
+    const served = policy({ policyVersion: 4 });
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(served));
+
+    const result = await fetchRoleApprovalPolicy(TOKEN, ORG_ID, new AbortController().signal);
+
+    expect(result).toEqual(served);
+    const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
+    expect(url).toContain(`/organizations/${ORG_ID}/role-approval-policy`);
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("fetchRoleApprovalPolicy rejects a malformed response rather than returning it", async () => {
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse({ not: "a policy" }));
+
+    await expect(
+      fetchRoleApprovalPolicy(TOKEN, ORG_ID, new AbortController().signal),
+    ).rejects.toThrow(/malformed/i);
+  });
+
+  it("fetchRoleApprovalPolicyHistory reads the history list and drops malformed entries", async () => {
+    const good = policy({ policyVersion: 1 });
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse([good, { not: "a policy" }]));
+
+    const result = await fetchRoleApprovalPolicyHistory(TOKEN, ORG_ID, new AbortController().signal);
+
+    expect(result).toEqual([good]);
+  });
+
+  it("previewRoleApprovalPolicyUpdate merges server-reported issues with local validation", async () => {
+    global.fetch = jest.fn().mockResolvedValue(
+      jsonResponse({
+        issues: [{ field: "approvalsRequired", message: "org-specific floor", severity: "error" }],
+      }),
+    );
+
+    const current = policy();
+    const draft = policy({ approvalsRequired: 0 }); // also fails local validation
+
+    const preview = await previewRoleApprovalPolicyUpdate(
+      TOKEN,
+      ORG_ID,
+      current,
+      draft,
+      new AbortController().signal,
+    );
+
+    expect(preview.issues.some((issue) => issue.message === "org-specific floor")).toBe(true);
+    expect(preview.issues.some((issue) => issue.field === "approvalsRequired" && issue.severity === "error")).toBe(
+      true,
+    );
+  });
+
+  it("updateRoleApprovalPolicy sends If-Match with the expected version and returns the server's result", async () => {
+    const updated = policy({ policyVersion: 3 });
+    global.fetch = jest.fn().mockResolvedValue(jsonResponse(updated));
+
+    const result = await updateRoleApprovalPolicy(
+      TOKEN,
+      ORG_ID,
+      policy({ policyVersion: 2 }),
+      2,
+      new AbortController().signal,
+    );
+
+    expect(result).toEqual(updated);
+    const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+    expect((init.headers as Record<string, string>)["If-Match"]).toBe("2");
+    expect(init.method).toBe("PUT");
+  });
+
+  it("updateRoleApprovalPolicy surfaces a 409 as ApiConflictError carrying the server's current entity", async () => {
+    const serverCurrent = policy({ policyVersion: 9 });
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ message: "stale", currentEntity: serverCurrent, submittedData: {} }),
+      headers: { get: () => null },
+    } as unknown as Response);
+
+    const error = await updateRoleApprovalPolicy(
+      TOKEN,
+      ORG_ID,
+      policy({ policyVersion: 2 }),
+      1, // stale expected version
+      new AbortController().signal,
+    ).catch((caught) => caught);
+
+    expect(isRoleApprovalPolicyConflict(error)).toBe(true);
+    expect((error as ApiConflictError).serverEntity).toEqual(serverCurrent);
+  });
+
+  it("isRoleApprovalPolicyConflict is false for every other error shape", () => {
+    expect(isRoleApprovalPolicyConflict(new Error("network down"))).toBe(false);
+    expect(isRoleApprovalPolicyConflict(null)).toBe(false);
   });
 });

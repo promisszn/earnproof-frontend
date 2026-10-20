@@ -5,12 +5,16 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { ActivityLogGate } from "@/components/activity/activity-log-gate";
 import { fetchActivityEvents } from "@/lib/api/activity";
-import { fetchMockCapabilityDocument, CAPABILITY_DOCUMENT_SHAPE_VERSION } from "@/lib/api/capabilities";
+import { fetchCapabilityDocument, CAPABILITY_DOCUMENT_SHAPE_VERSION } from "@/lib/api/capabilities";
 import { API_SPEC_VERSION } from "@/lib/api/generated/v1";
 
+// `CapabilityProvider`'s default fetcher is now `fetchCapabilityDocument`
+// (the real backend client, #307) rather than the local mock fixture — see
+// `lib/capabilities/capability-context.tsx`. Mocking it here is what makes
+// these tests deterministic without a real `/capabilities` endpoint.
 jest.mock("@/lib/api/capabilities", () => ({
   ...jest.requireActual("@/lib/api/capabilities"),
-  fetchMockCapabilityDocument: jest.fn(),
+  fetchCapabilityDocument: jest.fn(),
 }));
 
 jest.mock("@/lib/api/activity", () => ({
@@ -18,8 +22,8 @@ jest.mock("@/lib/api/activity", () => ({
   fetchActivityEvents: jest.fn(),
 }));
 
-const mockedFetchCapabilities = fetchMockCapabilityDocument as jest.MockedFunction<
-  typeof fetchMockCapabilityDocument
+const mockedFetchCapabilityDocument = fetchCapabilityDocument as jest.MockedFunction<
+  typeof fetchCapabilityDocument
 >;
 const mockedFetchActivityEvents = fetchActivityEvents as jest.MockedFunction<
   typeof fetchActivityEvents
@@ -27,19 +31,23 @@ const mockedFetchActivityEvents = fetchActivityEvents as jest.MockedFunction<
 
 beforeEach(() => {
   window.localStorage.clear();
-  mockedFetchCapabilities.mockReset();
+  mockedFetchCapabilityDocument.mockReset();
   mockedFetchActivityEvents.mockReset();
   mockedFetchActivityEvents.mockResolvedValue({ events: [], nextCursor: null });
 });
 
 describe("ActivityLogGate", () => {
   it("renders the activity log once the activity-log capability is enabled", async () => {
-    mockedFetchCapabilities.mockResolvedValue({
-      documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
-      apiVersion: API_SPEC_VERSION,
-      network: "testnet",
-      generatedAt: new Date().toISOString(),
-      capabilities: { "activity-log": { enabled: true } },
+    mockedFetchCapabilityDocument.mockResolvedValue({
+      kind: "fresh",
+      etag: null,
+      document: {
+        documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
+        apiVersion: API_SPEC_VERSION,
+        network: "testnet",
+        generatedAt: new Date().toISOString(),
+        capabilities: { "activity-log": { enabled: true } },
+      },
     });
 
     render(<ActivityLogGate />);
@@ -50,12 +58,16 @@ describe("ActivityLogGate", () => {
   });
 
   it("renders an explicit unavailable state (not a blank/hidden section) when the capability is disabled", async () => {
-    mockedFetchCapabilities.mockResolvedValue({
-      documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
-      apiVersion: API_SPEC_VERSION,
-      network: "testnet",
-      generatedAt: new Date().toISOString(),
-      capabilities: {},
+    mockedFetchCapabilityDocument.mockResolvedValue({
+      kind: "fresh",
+      etag: null,
+      document: {
+        documentVersion: CAPABILITY_DOCUMENT_SHAPE_VERSION,
+        apiVersion: API_SPEC_VERSION,
+        network: "testnet",
+        generatedAt: new Date().toISOString(),
+        capabilities: {},
+      },
     });
 
     render(<ActivityLogGate />);
@@ -67,7 +79,7 @@ describe("ActivityLogGate", () => {
   });
 
   it("fails closed (renders unavailable, not the activity log) when the capability document fails to load", async () => {
-    mockedFetchCapabilities.mockRejectedValue(new Error("network error"));
+    mockedFetchCapabilityDocument.mockRejectedValue(new Error("network error"));
 
     render(<ActivityLogGate />);
 
@@ -78,7 +90,7 @@ describe("ActivityLogGate", () => {
   });
 
   it("shows a loading state before the capability check resolves", () => {
-    mockedFetchCapabilities.mockReturnValue(new Promise(() => {})); // never resolves
+    mockedFetchCapabilityDocument.mockReturnValue(new Promise(() => {})); // never resolves
 
     render(<ActivityLogGate />);
 

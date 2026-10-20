@@ -1,8 +1,10 @@
 # Organization role approval policy
 
-Implements [#258](https://github.com/veridatum-labs/earnproof-frontend/issues/258):
-organizations need to configure which role changes require independent approval
-and how long approval requests remain valid.
+Implements [#258](https://github.com/veridatum-labs/earnproof-frontend/issues/258)
+(organizations need to configure which role changes require independent
+approval and how long approval requests remain valid) and
+[#309](https://github.com/veridatum-labs/earnproof-frontend/issues/309)
+(connecting that editor to the live backend instead of a client-local mock).
 
 ## Where it lives
 
@@ -65,4 +67,47 @@ Read-only roles (MEMBER/VIEWER) see a summary with all controls disabled.
 ## Authorization
 
 `canManageRoleApprovalPolicy()` (OWNER/ADMIN) is UX gating only. The server is
-the only authority for whether a policy write is allowed.
+the only authority for whether a policy write is allowed. The panel also
+requires a `token` prop — without one, management controls are disabled even
+for an OWNER/ADMIN `viewerRole`, since there is no session to authenticate a
+write with.
+
+## Real backend client (#309)
+
+`lib/api/organization-role-approval-policy.ts` exports four real network
+calls against `/organizations/{organizationId}/role-approval-policy` (not
+yet in `lib/api/openapi/earnproof-api.v1.json` — this is this frontend's
+forward contract for it), reusing the same `apiClient`/`bearer`/`retryRead`/
+`retryMutation` conventions as `lib/api/organizations.ts`:
+
+| Call | Method | Purpose |
+| --- | --- | --- |
+| `fetchRoleApprovalPolicy` | `GET .../role-approval-policy` | Current policy |
+| `fetchRoleApprovalPolicyHistory` | `GET .../role-approval-policy/history` | Version history |
+| `previewRoleApprovalPolicyUpdate` | `POST .../role-approval-policy/preview` | Server-side validation of a draft, merged with local `validateRoleApprovalPolicy` |
+| `updateRoleApprovalPolicy` | `PUT .../role-approval-policy` (`If-Match: <expectedVersion>`) | Conditional write |
+
+`fetchMockRoleApprovalPolicy` remains a fixture for local development/tests
+only and is never wired as the default in `RoleApprovalPolicyPanel`.
+
+**The UI never claims a save succeeded before the server confirms it.**
+`handleSave` in the panel: (1) runs the cheap local `applyPolicyUpdate`
+pre-check so an obviously invalid/weakening draft never reaches the network;
+(2) calls the preview endpoint, which is authoritative for org-specific
+minimums the client doesn't know about; (3) only then calls
+`updateRoleApprovalPolicy`; (4) only *that* call's resolution — never any
+earlier step — triggers the "Saved policy version N" notice and `onSaved`.
+
+**Stale versions are rejected, not silently overwritten.** The write is
+conditional (`If-Match` on the version the draft was loaded from). A stale
+write is rejected by the server with `409 Conflict`, which `apiClient`
+normalizes into `ApiConflictError` (`error.serverEntity` carries the
+server's current policy). The panel catches this specifically
+(`isRoleApprovalPolicyConflict`), adopts the server's real current policy
+into local state, and shows a "changed on the server" error — the next save
+attempt is based on real data, never a blind retry.
+
+A malformed server response at any of the four calls is rejected by
+`isWellFormedRoleApprovalPolicy` (or, for history, filtered entry-by-entry)
+rather than trusted — the same fail-closed discipline as
+`lib/api/capabilities.ts` and `lib/api/contract-migration.ts`.

@@ -1,23 +1,43 @@
 /**
- * Organization data-residency policy controls (#277).
- * ===================================================
+ * Organization data-residency policy controls (#277, connected to the
+ * backend in #310).
+ * =========================================================================
  *
  * Organizations need to review (and change) the allowed storage and processing
  * regions for regulated data classes and background jobs.
  *
- * Two guarantees drive every function here:
+ * Three guarantees drive every function here:
  *
  *   1. **No unsupported selection.** A region may only hold a data class the
  *      region's capability document permits, and never a deprecated region.
+ *      Enforced by `validateResidencyPolicy`/`applyResidencyUpdate`, which run
+ *      as a client-side pre-check before the server (the sole authority) is
+ *      ever asked to accept a write.
  *   2. **No compliance until it is real.** The UI must not imply a policy is
  *      in force until the server has validated it *and* every data class has
  *      finished migrating. `computeComplianceStatus()` therefore reports
  *      `compliant` only when both are true, and otherwise says exactly what is
- *      still outstanding.
+ *      still outstanding. An incomplete migration also blocks changing that
+ *      data class's placement at all (`computeMigrationBlockers`).
+ *   3. **Policy state is tenant- and deployment-scoped.** The in-memory cache
+ *      below (`getCachedDataResidencyPolicy`/`setCachedDataResidencyPolicy`/
+ *      `invalidateDataResidencyPolicyCache`) is keyed by *both*
+ *      `organizationId` and the current deployment identity
+ *      (`currentDeploymentIdentity()` from `lib/api/capabilities.ts`), so
+ *      switching the active organization or the deployment (API URL,
+ *      network, or spec version) can never serve another tenant's or
+ *      another environment's cached policy.
  *
  * As with the other policy modules, this is a client-side UX/readiness layer.
  * The server remains the only authority for what a region may store.
  */
+
+import {
+  currentDeploymentIdentity,
+  deploymentIdentityChanged,
+  type DeploymentIdentity,
+} from "@/lib/api/capabilities";
+import { ApiConflictError, apiClient, bearer, retryMutation, retryRead } from "@/lib/api/client";
 
 export const DATA_RESIDENCY_POLICY_SCHEMA_VERSION = 1;
 
@@ -483,6 +503,267 @@ export type DataResidencyPolicyResponse = {
   history: DataResidencyPolicy[];
 };
 
+/**
+ * Real data-residency-policy client (#310).
+ * ============================================
+ * Authenticated read/validate/preview/update/history/rollout-status calls
+ * against `/organizations/{organizationId}/data-residency-policy`. Not yet
+ * in `lib/api/openapi/earnproof-api.v1.json`; this is this frontend's
+ * forward contract for it, reusing the same `apiClient`/`bearer`/
+ * `retryRead`/`retryMutation` conventions as `lib/api/organizations.ts` and
+ * `lib/api/organization-role-approval-policy.ts`.
+ */
+function dataResidencyPolicyPath(organizationId: string): string {
+  return `/organizations/${encodeURIComponent(organizationId)}/data-residency-policy`;
+}
+
+/** Runtime shape guard for a parsed server response. */
+export function isWellFormedDataResidencyPolicy(value: unknown): value is DataResidencyPolicy {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<DataResidencyPolicy>;
+  if (candidate.schemaVersion !== DATA_RESIDENCY_POLICY_SCHEMA_VERSION) return false;
+  if (!Number.isInteger(candidate.policyVersion)) return false;
+  if (typeof candidate.updatedAt !== "string") return false;
+  if (!candidate.placements || typeof candidate.placements !== "object") return false;
+  for (const dataClass of DATA_CLASSES) {
+    const regions = candidate.placements[dataClass];
+    if (regions !== undefined && !Array.isArray(regions)) return false;
+  }
+  if (candidate.backgroundJobRegion !== null && !isProcessingRegion(candidate.backgroundJobRegion)) {
+    return false;
+  }
+  if (!candidate.migration || typeof candidate.migration !== "object") return false;
+  if (!["pending", "accepted", "rejected"].includes(candidate.serverValidation as string)) return false;
+  if (!candidate.rollout || typeof candidate.rollout !== "object") return false;
+  if (!["not-started", "in-progress", "complete"].includes(candidate.rollout.status)) return false;
+  return true;
+}
+
+/**
+ * Tenant- and deployment-scoped in-memory cache. Bounded (one entry per
+ * organization at a time — writing a new entry for an organization replaces
+ * its previous one) and never persisted, so there is nothing to clean up on
+ * sign-out; a page reload starts cold.
+ */
+type DataResidencyCacheEntry = {
+  response: DataResidencyPolicyResponse;
+  identity: DeploymentIdentity;
+  cachedAt: number;
+};
+
+export const DATA_RESIDENCY_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+
+const dataResidencyCache = new Map<string, DataResidencyCacheEntry>();
+
+export function getCachedDataResidencyPolicy(
+  organizationId: string,
+  now: number = Date.now(),
+): DataResidencyPolicyResponse | null {
+  const entry = dataResidencyCache.get(organizationId);
+  if (!entry) return null;
+
+  // Cross-environment fail-closed: a cached entry from a different
+  // deployment (API URL, network, or spec version) is never served, even
+  // if it's still within its TTL — an environment switch invalidates it.
+  if (deploymentIdentityChanged(entry.identity, currentDeploymentIdentity())) {
+    dataResidencyCache.delete(organizationId);
+    return null;
+  }
+
+  const age = now - entry.cachedAt;
+  if (age < 0 || age >= DATA_RESIDENCY_CACHE_TTL_MS) {
+    return null;
+  }
+  return entry.response;
+}
+
+export function setCachedDataResidencyPolicy(
+  organizationId: string,
+  response: DataResidencyPolicyResponse,
+  now: number = Date.now(),
+): void {
+  dataResidencyCache.set(organizationId, {
+    response,
+    identity: currentDeploymentIdentity(),
+    cachedAt: now,
+  });
+}
+
+/** Invalidates one organization's cache entry, or every entry when called with no argument (e.g. on sign-out). */
+export function invalidateDataResidencyPolicyCache(organizationId?: string): void {
+  if (organizationId === undefined) {
+    dataResidencyCache.clear();
+    return;
+  }
+  dataResidencyCache.delete(organizationId);
+}
+
+/**
+ * Reads the current policy and history, preferring the tenant-scoped cache
+ * when it is fresh for this exact organization and deployment. A cache hit
+ * never makes a network call.
+ */
+export async function fetchDataResidencyPolicy(
+  token: string,
+  organizationId: string,
+  signal: AbortSignal,
+  options: { skipCache?: boolean } = {},
+): Promise<DataResidencyPolicyResponse> {
+  if (!options.skipCache) {
+    const cached = getCachedDataResidencyPolicy(organizationId);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  return retryRead(async (innerSignal) => {
+    const [policy, history] = await Promise.all([
+      apiClient<unknown>({
+        path: dataResidencyPolicyPath(organizationId),
+        method: "GET",
+        headers: bearer(token),
+        signal: innerSignal,
+      }),
+      apiClient<unknown>({
+        path: `${dataResidencyPolicyPath(organizationId)}/history`,
+        method: "GET",
+        headers: bearer(token),
+        signal: innerSignal,
+      }),
+    ]);
+
+    if (!isWellFormedDataResidencyPolicy(policy)) {
+      throw new Error("The data residency policy response was malformed.");
+    }
+    if (!Array.isArray(history)) {
+      throw new Error("The data residency policy history response was malformed.");
+    }
+
+    const response: DataResidencyPolicyResponse = {
+      policy,
+      history: history.filter(isWellFormedDataResidencyPolicy),
+    };
+    setCachedDataResidencyPolicy(organizationId, response);
+    return response;
+  }, signal);
+}
+
+export type DataResidencyPreview = {
+  issues: ResidencyValidationIssue[];
+  blockers: MigrationBlocker[];
+  impact: ResidencyImpactSummary;
+};
+
+/** Server-side preview of applying `draft` on top of `current`. Never mutates anything. */
+export async function previewResidencyPolicyUpdate(
+  token: string,
+  organizationId: string,
+  current: DataResidencyPolicy,
+  draft: DataResidencyPolicy,
+  signal: AbortSignal,
+): Promise<DataResidencyPreview> {
+  return retryRead(async (innerSignal) => {
+    const response = await apiClient<{
+      issues?: ResidencyValidationIssue[];
+      blockers?: MigrationBlocker[];
+    }>({
+      path: `${dataResidencyPolicyPath(organizationId)}/preview`,
+      method: "POST",
+      headers: bearer(token),
+      body: JSON.stringify({ draft, expectedVersion: current.policyVersion }),
+      signal: innerSignal,
+    });
+
+    const serverIssues = Array.isArray(response?.issues) ? response.issues : [];
+    const serverBlockers = Array.isArray(response?.blockers) ? response.blockers : [];
+    return {
+      issues: [...validateResidencyPolicy(draft), ...serverIssues],
+      blockers: [...computeMigrationBlockers(current, draft), ...serverBlockers],
+      impact: summarizeResidencyImpact(current, draft),
+    };
+  }, signal);
+}
+
+/**
+ * Submits `draft`, conditional on the server's version still matching
+ * `expectedVersion` (`If-Match`). A stale write is rejected as
+ * `409 Conflict`, surfaced by `apiClient` as `ApiConflictError`. On success,
+ * invalidates this organization's cache (the response itself is the new
+ * truth; the next read will repopulate it) and returns the server's result.
+ */
+export async function updateDataResidencyPolicy(
+  token: string,
+  organizationId: string,
+  draft: DataResidencyPolicy,
+  expectedVersion: number,
+  signal: AbortSignal,
+): Promise<DataResidencyPolicy> {
+  return retryMutation(async (innerSignal) => {
+    const updated = await apiClient<unknown>({
+      path: dataResidencyPolicyPath(organizationId),
+      method: "PUT",
+      headers: { ...bearer(token), "If-Match": String(expectedVersion) },
+      body: JSON.stringify(draft),
+      signal: innerSignal,
+    });
+    if (!isWellFormedDataResidencyPolicy(updated)) {
+      throw new Error("The data residency policy response was malformed after update.");
+    }
+    invalidateDataResidencyPolicyCache(organizationId);
+    return updated;
+  }, signal);
+}
+
+export type DataResidencyRolloutStatus = {
+  migration: Record<DataClass, MigrationState>;
+  rollout: DataResidencyPolicy["rollout"];
+  serverValidation: DataResidencyPolicy["serverValidation"];
+};
+
+/**
+ * Polls just the rollout/migration progress for `organizationId`, without
+ * re-fetching (or trusting a cached copy of) the full policy — a long-running
+ * region migration's progress should always be current when checked.
+ */
+export async function fetchDataResidencyRolloutStatus(
+  token: string,
+  organizationId: string,
+  signal: AbortSignal,
+): Promise<DataResidencyRolloutStatus> {
+  return retryRead(async (innerSignal) => {
+    const response = await apiClient<unknown>({
+      path: `${dataResidencyPolicyPath(organizationId)}/rollout-status`,
+      method: "GET",
+      headers: bearer(token),
+      signal: innerSignal,
+    });
+
+    if (!response || typeof response !== "object") {
+      throw new Error("The rollout status response was malformed.");
+    }
+    const candidate = response as Partial<DataResidencyRolloutStatus>;
+    if (!candidate.migration || typeof candidate.migration !== "object") {
+      throw new Error("The rollout status response was malformed.");
+    }
+    if (!candidate.rollout || !["not-started", "in-progress", "complete"].includes(candidate.rollout.status)) {
+      throw new Error("The rollout status response was malformed.");
+    }
+    if (!["pending", "accepted", "rejected"].includes(candidate.serverValidation as string)) {
+      throw new Error("The rollout status response was malformed.");
+    }
+    return candidate as DataResidencyRolloutStatus;
+  }, signal);
+}
+
+/** True for the one error shape `updateDataResidencyPolicy` can throw that means "stale write". */
+export function isDataResidencyPolicyConflict(error: unknown): error is ApiConflictError {
+  return error instanceof ApiConflictError;
+}
+
+/**
+ * Fixture/forward-contract provider for local development and tests only —
+ * never wired as the default in `DataResidencyPolicyPanel`.
+ */
 export async function fetchMockDataResidencyPolicy(
   overrides: Partial<DataResidencyPolicy> = {},
   history: DataResidencyPolicy[] = [],

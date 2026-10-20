@@ -27,13 +27,17 @@
  *     the same as the current contract, and points at a safe HTTPS URL. The
  *     client must never redirect to an unverified successor.
  *
- * There is no `/contracts/migration` route in the real EarnProof API
- * (`lib/api/openapi/earnproof-api.v1.json`) yet. `fetchMockContractMigrationStatus`
- * is a stand-in for that future endpoint, shaped exactly like a real one, so
- * only the fetcher needs to change when it ships — never the gating contract.
+ * There is no `/contracts/migration-status` route in
+ * `lib/api/openapi/earnproof-api.v1.json` yet. `fetchContractMigrationStatus`
+ * is the production client for this frontend's forward contract for that
+ * route (see its own comment below); `fetchMockContractMigrationStatus`
+ * remains a fixture for local development/tests only and is never wired as
+ * the default in `ContractMigrationStatusBanner`.
  */
 
 import { appConfig } from "@/config/app";
+import { fetchWithTimeout } from "@/lib/api/client";
+import { recordNetworkFailure, recordNetworkSuccess } from "@/lib/network";
 
 export const CONTRACT_MIGRATION_SCHEMA_VERSION = 1;
 
@@ -325,10 +329,172 @@ export function migrationBannerCopy(
 }
 
 /**
+ * How long a successfully-fetched status may be trusted to authorize a
+ * successor redirect before it must be re-validated by another fetch. This
+ * is deliberately shorter than how long the banner keeps *showing* a status
+ * (an unreachable backend must never silently re-enable writes — see
+ * `ContractMigrationStatusBanner` — but it also must never let an
+ * increasingly-stale cached "replaced" status keep pointing users at a
+ * successor without checking back in).
+ */
+export const MIGRATION_STATUS_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes
+
+/**
+ * Whether a status fetched at `fetchedAt` is still fresh enough to authorize
+ * a successor redirect. A status that has merely gone stale is NOT treated
+ * as "no migration information" (which would wrongly re-enable writes) — it
+ * is still rendered and still gates writes; it simply stops being eligible
+ * to produce a new successor link until revalidated.
+ */
+export function isMigrationStatusFresh(fetchedAt: number | null, now: number = Date.now()): boolean {
+  if (fetchedAt === null) {
+    return false;
+  }
+  const age = now - fetchedAt;
+  if (age < 0) {
+    // Clock skew/tamper guard, same convention as the capability cache.
+    return false;
+  }
+  return age < MIGRATION_STATUS_MAX_AGE_MS;
+}
+
+/**
+ * Real migration-status client (#308).
+ * =====================================
+ * `GET {apiUrl}/contracts/migration-status` — not yet in
+ * `earnproof-api.v1.json`; this is this frontend's forward contract for it.
+ * Unauthenticated: the banner this feeds is mounted in the root layout,
+ * before any session exists, so the endpoint must be reachable without a
+ * bearer token.
+ */
+export const CONTRACT_MIGRATION_STATUS_PATH = "/contracts/migration-status" as const;
+
+export type MigrationStatusFetchReason = "network" | "malformed" | "unauthorized" | "untrusted";
+
+/** Thrown by `fetchContractMigrationStatus` for any outcome other than a trusted 200/304. */
+export class MigrationStatusError extends Error {
+  readonly reason: MigrationStatusFetchReason;
+
+  constructor(reason: MigrationStatusFetchReason, message: string) {
+    super(message);
+    this.name = "MigrationStatusError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * Runtime shape guard, stricter than `isSupportedMigrationStatus`: it checks
+ * every field's type, not just the ones gating decisions, so a response the
+ * server shaped incorrectly can never be partially trusted.
+ */
+export function isWellFormedMigrationStatus(value: unknown): value is ContractMigrationStatus {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<ContractMigrationStatus>;
+  if (typeof candidate.schemaVersion !== "number") return false;
+  if (typeof candidate.network !== "string") return false;
+  if (typeof candidate.currentContractId !== "string") return false;
+  if (!isMigrationPhase(candidate.phase)) return false;
+  if (candidate.effectiveAt !== undefined && typeof candidate.effectiveAt !== "string") return false;
+  if (candidate.readOnlySince !== undefined && typeof candidate.readOnlySince !== "string") return false;
+  if (candidate.statusPageUrl !== undefined && typeof candidate.statusPageUrl !== "string") return false;
+  if (candidate.successor !== undefined) {
+    if (!candidate.successor || typeof candidate.successor !== "object") return false;
+    const successor = candidate.successor as Partial<SuccessorContract>;
+    if (typeof successor.contractId !== "string") return false;
+    if (typeof successor.verified !== "boolean") return false;
+    if (successor.label !== undefined && typeof successor.label !== "string") return false;
+    if (successor.migrationGuideUrl !== undefined && typeof successor.migrationGuideUrl !== "string") {
+      return false;
+    }
+  }
+  return true;
+}
+
+export type MigrationStatusFetchResult =
+  | { kind: "fresh"; status: ContractMigrationStatus; etag: string | null }
+  | { kind: "not-modified" };
+
+/**
+ * Fetches the migration status directly from the backend. Bounded by the
+ * same request timeout as every other client in this codebase, cancellable
+ * via `AbortSignal`, and supports conditional revalidation via `etag`
+ * (mirrors `fetchCapabilityDocument` in `lib/api/capabilities.ts`).
+ *
+ * Fails closed (throws `MigrationStatusError`) for any network failure, a
+ * non-2xx/304 response, a malformed body, or a well-formed body computed for
+ * a different network than this deployment's (`"untrusted"`) — the same
+ * fail-closed reasons `fetchCapabilityDocument` uses, for consistency.
+ */
+export async function fetchContractMigrationStatus(
+  options: { signal?: AbortSignal; etag?: string | null } = {},
+): Promise<MigrationStatusFetchResult> {
+  const { signal, etag } = options;
+
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(`${appConfig.apiUrl}${CONTRACT_MIGRATION_STATUS_PATH}`, {
+      method: "GET",
+      signal,
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        ...(etag ? { "If-None-Match": etag } : {}),
+      },
+    });
+  } catch (error) {
+    recordNetworkFailure();
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw error;
+    }
+    throw new MigrationStatusError("network", "Could not reach the migration status endpoint.");
+  }
+
+  if (response.status === 304) {
+    recordNetworkSuccess();
+    return { kind: "not-modified" };
+  }
+
+  if (!response.ok) {
+    recordNetworkFailure();
+    if (response.status === 401 || response.status === 403) {
+      throw new MigrationStatusError("unauthorized", "The migration status endpoint rejected this request.");
+    }
+    throw new MigrationStatusError("network", `The migration status endpoint returned ${response.status}.`);
+  }
+
+  recordNetworkSuccess();
+
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new MigrationStatusError("malformed", "The migration status response was not valid JSON.");
+  }
+
+  if (!isWellFormedMigrationStatus(body)) {
+    throw new MigrationStatusError("malformed", "The migration status response was malformed.");
+  }
+
+  if (!isMigrationStatusForCurrentNetwork(body)) {
+    throw new MigrationStatusError(
+      "untrusted",
+      "The migration status was not computed for this deployment's network.",
+    );
+  }
+
+  return { kind: "fresh", status: body, etag: response.headers.get("etag") };
+}
+
+/**
  * Fixture/forward-contract provider for the (not-yet-existing) migration
  * endpoint. Returns a "stable" status by default so the banner stays silent in
  * configurations where no migration is in progress. Tests and local
  * development pass `overrides` to simulate preparing/migrating/replaced states.
+ *
+ * Never wired as the production default — see `fetchContractMigrationStatus`
+ * above and `ContractMigrationStatusBanner`'s default fetcher.
  */
 export async function fetchMockContractMigrationStatus(
   overrides: Partial<ContractMigrationStatus> = {},
